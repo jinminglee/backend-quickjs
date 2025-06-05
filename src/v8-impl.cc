@@ -383,8 +383,44 @@ bool Value::IsExternal() const {
     return JS_VALUE_GET_TAG(value_) == JS_TAG_EXTERNAL;
 }
 
+template <class Dest, class Source>
+inline Dest bit_cast(Source const& source) {
+    static_assert(sizeof(Dest) == sizeof(Source),
+                  "source and dest must be same size");
+    Dest dest;
+    memcpy(&dest, &source, sizeof(dest));
+    return dest;
+}
+static inline bool IsMinusZero(double value) {
+    return bit_cast<int64_t>(value) == bit_cast<int64_t>(-0.0);
+}
+
+constexpr int kMaxInt = 0x7FFFFFFF;
+constexpr int kMinInt = -kMaxInt - 1;
+// The fast double-to-(unsigned-)int conversion routine does not guarantee
+// rounding towards zero.
+// The result is undefined if x is infinite or NaN, or if the rounded
+// integer value is outside the range of type int.
+inline int FastD2I(double x) {
+    //DCHECK(x <= INT_MAX);
+    //DCHECK(x >= INT_MIN);
+    return static_cast<int32_t>(x);
+}
+inline double FastI2D(int x) {
+    // There is no rounding involved in converting an integer to a
+    // double, so this code should compile to a few instructions without
+    // any FPU pipeline stalls.
+    return static_cast<double>(x);
+}
 bool Value::IsInt32() const {
-    return (bool)JS_IsNumber(value_);
+    int tag = JS_VALUE_GET_TAG(value_);
+    if(tag == JS_TAG_INT) return true;
+    if (JS_TAG_IS_FLOAT64(tag))
+    {
+        double d = JS_VALUE_GET_FLOAT64(value_);
+        return d >= kMinInt && d <= kMaxInt && d == FastI2D(FastD2I(d)) && !IsMinusZero(d);
+    }
+    return false;
 }
 
 bool Value::IsUint32() const{
