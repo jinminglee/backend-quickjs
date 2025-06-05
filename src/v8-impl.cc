@@ -1,10 +1,4 @@
-#ifdef USING_IN_UNREAL_ENGINE
-PRAGMA_DISABLE_UNDEFINED_IDENTIFIER_WARNINGS
-#endif
 #include "v8.h"
-#ifdef USING_IN_UNREAL_ENGINE
-PRAGMA_ENABLE_UNDEFINED_IDENTIFIER_WARNINGS
-#endif
 #include<cstring>
 #include <algorithm>
 
@@ -91,6 +85,64 @@ Isolate* Promise::GetIsolate() {
     return Isolate::current_;
 }
 
+Local<Value> Promise::Result() {
+    JSValue result = JS_GetPromiseResult(GetIsolate()->GetCurrentContext()->context_, value_);
+
+    Value* val = GetIsolate()->Alloc<Value>();
+    val->value_ = result;
+    return Local<Value>(val);
+}
+
+Promise::PromiseState Promise::State() {
+    int promiseStateInQuickJS = JS_GetPromiseState(value_);
+    switch(promiseStateInQuickJS) {
+        case 0:
+            return Promise::PromiseState::kPending;
+        case 1:
+            return Promise::PromiseState::kFulfilled;
+        case 2:
+            return Promise::PromiseState::kRejected;
+    }
+}
+
+MaybeLocal<Promise::Resolver> Promise::Resolver::New(Local<Context> context) {
+    auto Isolate = context->GetIsolate();
+    Promise::Resolver *resolver = Isolate->Alloc<Promise::Resolver>();
+
+    JSValue resolving_funcs[2];
+    auto ctx = Isolate->current_context_->context_;
+    resolver->value_ = JS_NewPromiseCapability(ctx, resolving_funcs);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+
+    return MaybeLocal<Promise::Resolver>(Local<Promise::Resolver>(resolver));
+}
+
+Local<Promise> Promise::Resolver::GetPromise() {
+    return Local<Promise>(Promise::Cast(this));
+}
+
+Maybe<bool> Promise::Resolver::Resolve(Local<Context> context, Local<Value> value) {
+    return Maybe<bool>(JS_FullfillOrRejectPromise(context->context_, value_, value->value_, 0));
+}
+
+Maybe<bool> Promise::Resolver::Reject(Local<Context> context, Local<Value> value) {
+    return Maybe<bool>(JS_FullfillOrRejectPromise(context->context_, value_, value->value_, 1));
+}
+
+Local<Symbol> Symbol::New(Isolate* isolate, Local<String> description) {
+    auto symbol = isolate->Alloc<Symbol>();
+    auto context = isolate->current_context_->context_;
+    auto atom = JS_NewAtom(context, *String::Utf8Value(isolate, description));
+    symbol->value_ = JS_NewSymbolByAtom(
+        isolate->current_context_->context_, 
+        atom,
+        2
+    );
+    JS_FreeAtom(context, atom);
+    return Local<Symbol>(symbol);
+}
+
 void V8FinalizerWrap(JSRuntime *rt, JSValue val) {
     Isolate* isolate = (Isolate*)JS_GetRuntimeOpaque(rt);
     Isolate::Scope Isolatescope(isolate);
@@ -117,8 +169,7 @@ Isolate::Isolate(void* external_runtime) : current_context_(nullptr) {
     literal_values_[kFalseValueIndex] = JS_False();
     literal_values_[kEmptyStringIndex] = JS_Undefined();
     
-    pendingException_ = JS_Undefined();
-    hasPendingException_ = false;
+    exception_ = JS_Undefined();
     
     JSClassDef cls_def;
     cls_def.class_name = "__v8_simulate_obj";
@@ -181,11 +232,7 @@ Isolate* Isolate::current_ = nullptr;
 void Isolate::handleException() {
     JSValue ex = JS_GetException(current_context_->context_);
     
-    if (!JS_IsUndefined(ex)) {
-        if (JS_IsNull(ex)) {
-            std::cerr << "Uncaught exception(null)" << std::endl;
-            return;
-        }
+    if (!JS_IsUndefined(ex) && !JS_IsNull(ex)) {
         JSValue fileNameVal = JS_GetProperty(current_context_->context_, ex, JS_ATOM_fileName);
         JSValue lineNumVal = JS_GetProperty(current_context_->context_, ex, JS_ATOM_lineNumber);
         
@@ -216,8 +263,7 @@ void Isolate::LowMemoryNotification() {
 }
 
 Local<Value> Isolate::ThrowException(Local<Value> exception) {
-    pendingException_ = exception->value_;
-    hasPendingException_ = true;
+    exception_ = exception->value_;
     this->Escape(*exception);
     return Local<Value>(exception);
 }
@@ -252,9 +298,6 @@ Local<Value> Exception::Error(Local<String> message) {
 
 Local<Message> Exception::CreateMessage(Isolate* isolate_, Local<Value> exception) {
     JSValueConst catched_ = exception->value_;
-    if (!JS_IsObject(catched_)) {
-        return Local<Message>();
-    }
     JSValue fileNameVal = JS_GetProperty(isolate_->current_context_->context_, catched_, JS_ATOM_fileName);
     JSValue lineNumVal = JS_GetProperty(isolate_->current_context_->context_, catched_, JS_ATOM_lineNumber);
     
@@ -346,6 +389,10 @@ bool Value::IsInt32() const {
 
 bool Value::IsUint32() const{
     return (bool)JS_IsNumber(value_);
+}
+
+bool Value::IsPromise() const{
+    return (bool)JS_IsPromise(value_);
 }
 
 MaybeLocal<BigInt> Value::ToBigInt(Local<Context> context) const {
@@ -443,11 +490,10 @@ int String::Utf8Length(Isolate* isolate) const {
 int String::WriteUtf8(Isolate* isolate, char* buffer) const {
     size_t len;
     const char* p = JS_ToCStringLen(isolate->current_context_->context_, &len, value_);
-    
     memcpy(buffer, p, len);
-    buffer[len] = '\0';
     
     JS_FreeCString(isolate->current_context_->context_, p);
+    buffer[len] = 0;
     return (int)len;
 }
 
@@ -466,8 +512,7 @@ MaybeLocal<Script> Script::Compile(
 static V8_INLINE MaybeLocal<Value> ProcessResult(Isolate *isolate, JSValue ret) {
     Value* val = nullptr;
     if (JS_IsException(ret)) {
-        isolate->pendingException_ = JS_GetException(isolate->current_context_->context_);
-        isolate->hasPendingException_ = true;
+        isolate->exception_ = JS_GetException(isolate->current_context_->context_);
         if (!isolate->currentTryCatch_) {
             isolate->handleException();
         }
@@ -485,8 +530,8 @@ MaybeLocal<Value> Script::Run(Local<Context> context) {
     auto isolate = context->GetIsolate();
 
     String::Utf8Value source(isolate, source_);
-    const char *filename = resource_name_.IsEmpty() ? "eval" : *String::Utf8Value(isolate, resource_name_.ToLocalChecked());
-    JS_UpdateStackTop(isolate->runtime_);
+    String::Utf8Value resource_name(isolate, resource_name_.ToLocalChecked());
+    const char *filename = resource_name_.IsEmpty() ? "eval" : *resource_name;
     auto ret = JS_Eval(context->context_, *source, source.length(), filename, JS_EVAL_TYPE_GLOBAL);
 
     return ProcessResult(isolate, ret);
@@ -726,7 +771,7 @@ ArrayBuffer::Contents ArrayBuffer::GetContents() {
 }
 
 std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(
-    void* data, size_t byte_length, BackingStore::DeleterCallback deleter,
+    void* data, size_t byte_length, v8::BackingStore::DeleterCallback deleter,
     void* deleter_data
 ) {
     V8::Check(deleter == BackingStore::EmptyDeleter, "only BackingStore::EmptyDeleter support!");
@@ -817,8 +862,6 @@ MaybeLocal<Value> Function::Call(Local<Context> context,
         //isolate->Escape(*argv[i]);
         js_argv[i] = argv[i]->value_;
     }
-    
-    JS_UpdateStackTop(isolate->runtime_);
     JSValue ret = JS_Call(context->context_, value_, *js_this, argc, js_argv);
     
     return ProcessResult(isolate, ret);
@@ -832,7 +875,6 @@ MaybeLocal<Object> Function::NewInstance(Local<Context> context, int argc, Local
         js_argv[i] = argv[i]->value_;
     }
     
-    JS_UpdateStackTop(isolate->runtime_);
     JSValue ret = JS_CallConstructor(context->context_, value_, argc, js_argv);
     
     auto maybe_value = ProcessResult(isolate, ret);
@@ -850,7 +892,15 @@ void Template::Set(Isolate* isolate, const char* name, Local<Data> value) {
 void Template::Set(Local<Name> name, Local<Data> value,
                    PropertyAttribute attributes) {
     Isolate* isolate = Isolate::current_;
-    Set(isolate, *String::Utf8Value(Isolate::current_, name), value);
+    
+    if (name->IsSymbol())
+    {
+        fieldsByAtom_[JS_SymbolToAtom(isolate->current_context_->context_, Symbol::Cast(*name)->value_)] = value;
+    }
+    else
+    {
+        Set(isolate, *String::Utf8Value(Isolate::current_, name), value);
+    }
 }
     
 void Template::SetAccessorProperty(Local<Name> name,
@@ -869,6 +919,13 @@ void Template::InitPropertys(Local<Context> context, JSValue obj) {
         context->GetIsolate()->Escape(*lfunc);
         JS_DefinePropertyValue(context->context_, obj, atom, lfunc->value_, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE);
         JS_FreeAtom(context->context_, atom);
+    }
+    for(auto it : fieldsByAtom_) {
+        JSAtom atom = it.first;
+        Local<FunctionTemplate> funcTpl = Local<FunctionTemplate>::Cast(it.second);
+        Local<Function> lfunc = funcTpl->GetFunction(context).ToLocalChecked();
+        context->GetIsolate()->Escape(*lfunc);
+        JS_DefinePropertyValue(context->context_, obj, atom, lfunc->value_, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE);
     }
     
     for (auto it : accessor_property_infos_) {
@@ -955,10 +1012,9 @@ void ObjectTemplate::InitAccessors(Local<Context> context, JSValue obj) {
                 AccessorNameGetterCallback callback = (AccessorNameGetterCallback)(JS_VALUE_GET_PTR(func_data[0]));
                 callback(Local<String>(key), callbackInfo);
                 
-                if (isolate->hasPendingException_) {
-                    JSValue ex = isolate->pendingException_;
-                    isolate->pendingException_ = JS_Undefined();
-                    isolate->hasPendingException_ = false;
+                if (!JS_IsUndefined(isolate->exception_)) {
+                    JSValue ex = isolate->exception_;
+                    isolate->exception_ = JS_Undefined();
                     return JS_Throw(ctx, ex);
                 }
                 
@@ -992,10 +1048,9 @@ void ObjectTemplate::InitAccessors(Local<Context> context, JSValue obj) {
                 AccessorNameSetterCallback callback = (AccessorNameSetterCallback)(JS_VALUE_GET_PTR(func_data[0]));
                 callback(Local<String>(key), Local<Value>(val), callbackInfo);
                 
-                if (isolate->hasPendingException_) {
-                    JSValue ex = isolate->pendingException_;
-                    isolate->pendingException_ = JS_Undefined();
-                    isolate->hasPendingException_ = false;
+                if (!JS_IsUndefined(isolate->exception_)) {
+                    JSValue ex = isolate->exception_;
+                    isolate->exception_ = JS_Undefined();
                     return JS_Throw(ctx, ex);
                 }
                 
@@ -1120,15 +1175,14 @@ MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
             JS_SetOpaque(callbackInfo.this_, object_udata);
         }
         
-        if (callback) callback(callbackInfo);
+        callback(callbackInfo);
         
-        if (isolate->hasPendingException_) {
+        if (!JS_IsUndefined(isolate->exception_)) {
             if (callbackInfo.isConstructCall && internal_field_count > 0) {
                 JS_FreeValue(ctx, callbackInfo.this_);
             }
-            JSValue ex = isolate->pendingException_;
-            isolate->pendingException_ = JS_Undefined();
-            isolate->hasPendingException_ = false;
+            JSValue ex = isolate->exception_;
+            isolate->exception_ = JS_Undefined();
             //isolate->Escape(&ex);
             return JS_Throw(ctx, ex);
         }
@@ -1136,15 +1190,13 @@ MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
         return callbackInfo.isConstructCall ? callbackInfo.this_ : callbackInfo.value_;
     }, 0, 0, 4, &func_data[0]);
     
-    auto aname = JS_NewAtom(context->context_, name_.c_str());
     JS_DefinePropertyValue( 
         context->context_, 
         func, 
         JS_ATOM_name,
-        JS_AtomToString(context->context_, aname), 
+        JS_AtomToString(context->context_, JS_NewAtom(context->context_, name_.c_str())), 
         JS_PROP_CONFIGURABLE
     );
-    JS_FreeAtom(context->context_, aname);
 
     if (cfunction_data_.is_construtor_) {
         JS_SetConstructorBit(context->context_, func, 1);
@@ -1368,25 +1420,24 @@ TryCatch::TryCatch(Isolate* isolate) {
 TryCatch::~TryCatch() {
     isolate_->currentTryCatch_ = prev_;
     JS_FreeValue(isolate_->current_context_->context_, catched_);
-    if (isolate_->hasPendingException_) {
-        JS_FreeValueRT(isolate_->runtime_, isolate_->pendingException_);
-        isolate_->pendingException_ = JS_Undefined();
-        isolate_->hasPendingException_ = false;
+    if (!JS_IsUndefined(isolate_->exception_) && !JS_IsNull(isolate_->exception_)) {
+        JS_FreeValueRT(isolate_->runtime_, isolate_->exception_);
+        isolate_->exception_ = JS_Undefined();
     }
 }
     
 bool TryCatch::HasCaught() const {
-    return (!JS_IsUndefined(catched_)) || isolate_->hasPendingException_;
+    return (!JS_IsUndefined(catched_) && !JS_IsNull(catched_)) || (!JS_IsUndefined(isolate_->exception_) && !JS_IsNull(isolate_->exception_));
 }
     
 Local<Value> TryCatch::Exception() const {
-    return isolate_->hasPendingException_ ? Local<Value>(reinterpret_cast<Value*>(&isolate_->pendingException_))
-               : Local<Value>(reinterpret_cast<Value*>(const_cast<JSValue*>(&catched_)));
+    return (!JS_IsUndefined(catched_) && !JS_IsNull(catched_)) ? Local<Value>(reinterpret_cast<Value*>(const_cast<JSValue*>(&catched_)))
+               : Local<Value>(reinterpret_cast<Value*>(&isolate_->exception_));
 }
 
 MaybeLocal<Value> TryCatch::StackTrace(Local<Context> context) const {
     auto str = context->GetIsolate()->Alloc<String>();
-    JSValue ex = isolate_->hasPendingException_ ?  isolate_->pendingException_ : catched_;
+    JSValue ex = (!JS_IsUndefined(catched_) && !JS_IsNull(catched_)) ? catched_ : isolate_->exception_;
     str->value_ = JS_GetProperty(isolate_->current_context_->context_, ex, JS_ATOM_stack);;
     return MaybeLocal<Value>(Local<String>(str));
 }
@@ -1400,10 +1451,7 @@ MaybeLocal<Value> TryCatch::StackTrace(
 }
     
 Local<class Message> TryCatch::Message() const {
-    JSValue ex = isolate_->hasPendingException_ ?  isolate_->pendingException_ : catched_;
-    if (!JS_IsObject(ex)) {
-        return Local<class Message>();
-    }
+    JSValue ex = (!JS_IsUndefined(catched_) && !JS_IsNull(catched_)) ? catched_ : isolate_->exception_;
     JSValue fileNameVal = JS_GetProperty(isolate_->current_context_->context_, ex, JS_ATOM_fileName);
     JSValue lineNumVal = JS_GetProperty(isolate_->current_context_->context_, ex, JS_ATOM_lineNumber);
     
