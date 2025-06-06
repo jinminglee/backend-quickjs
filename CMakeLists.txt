@@ -31,14 +31,23 @@ else()
 endif()
 
 set(SRC_FILES
-        quickjs/cutils.c
-        quickjs/libbf.c
-        quickjs/libregexp.c
-        quickjs/libunicode.c
-        quickjs/quickjs.c
+ quickjs/cutils.c
+ quickjs/libbf.c
+ quickjs/libregexp.c
+ quickjs/libunicode.c
+ quickjs/quickjs.c
+ quickjs/quickjs-debugger.c
+ quickjs/unicode_gen.c
         )
 if ( NOT MSYS OR NOT WIN_DLL )
-    list(APPEND SRC_FILES src/v8-impl.cc)
+    list(APPEND SRC_FILES 
+    src/v8-impl.cc
+    quickjs/quickjs-debugger-transport-unix.c)
+endif()
+
+if (MSYS AND WIN_DLL)
+    list(APPEND SRC_FILES 
+    quickjs/quickjs-debugger-transport-win.c)
 endif()
 
 file(STRINGS "quickjs/_VERSION" QJS_VERSION_STR)
