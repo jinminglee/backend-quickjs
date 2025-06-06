@@ -47,7 +47,7 @@ endif()
 
 if (MSYS AND WIN_DLL)
     list(APPEND SRC_FILES 
-    quickjs/quickjs-debugger-transport-win.c)
+    quickjs/quickjs-debugger-transport-unix.c)
 endif()
 
 file(STRINGS "quickjs/_VERSION" QJS_VERSION_STR)
