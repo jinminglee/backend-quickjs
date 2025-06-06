@@ -1818,7 +1818,7 @@ static int compute_stack_size(const uint8_t *bc_buf, int bc_buf_len)
    Return NULL if error and allocate an error message in *perror_msg,
    otherwise the compiled bytecode and its length in plen.
 */
-uint8_t *lre_compile_puer(int *plen, char *error_msg, int error_msg_size,
+uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
                      void *opaque)
 {

@@ -39,7 +39,7 @@
 
 #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
 
-uint8_t *lre_compile_puer(int *plen, char *error_msg, int error_msg_size,
+uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
                      void *opaque);
 int lre_get_capture_count(const uint8_t *bc_buf);
